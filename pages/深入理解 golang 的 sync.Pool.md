@@ -5,67 +5,63 @@ title:: 深入理解 golang 的 sync.Pool
 	- 它是一种资源复用的机制。类似连接池、线程池。可以让我们尽可能少地创建新资源，复用以前的资源。
 - # 为什么要使用sync.Pool?
 	- 这在资源频繁创建的场景下十分有用，能够显著提高程序的性能。针对那种生命周期很短的对象很有用。如果你的对象是长期存在的，那么可能没有必要使用sync.Pool。
-# 内部实现
-
-sync.Pool是对象复用的一种技术，它是协程安全的。值得注意的是它在清除对象是自动的（在GC时清除），且不会通知用户，如果此时对象只被Pool持有，那么可能会被释放（存放在victim的资源可能在GC时会被释放）。
-
-sync.Pool的定义如下：
-
-```go
-type Pool struct {
-	noCopy noCopy
-	local     unsafe.Pointer // local fixed-size per-P pool, actual type is [P]poolLocal
-	localSize uintptr        // size of the local array
-	victim     unsafe.Pointer // local from previous cycle
-	victimSize uintptr        // size of victims array
-	New func() any
-}
-```
-
-其中`noCopy`表示在第一次使用后就不能拷贝，如果出现拷贝，可以配合go vet检测出。`local`其实指向了一个`poolLocal`的数组。长度为P（GMP模型）的数量。每个index下保存着当前P所持有的对象池。`victimSize`保存了上一次清理前的`local`所持有的对象池，这个会在Get、GC的时候会用到，对于平滑性能很重要。`New`是唯一向用户暴露的字段，它表示如果当前pool中没有可用的资源时，会调用该函数去创建新对象然后返回给用户。
-## poolLocal
-
-`poolLocal`是跟P绑定的，用来存放所有资源对象的结构体。`sync.Pool`**能够在多个goroutinue中并发访问也是因为每个G只访问当前P的poolLocal，单个P一次只能运行一个G，所以在P的视角上是单线程，所以是线程安全的。**
-
-在sync.Pool暴露的Put和Get方法中，都会调用`pin`这个方法。因为go支持抢占式调度，所以在拿poolLocal的时候需要禁用抢占，直到操作完成后才把抢占打开。（根据goroutine的特性，G会在各个P中流转，**如果不禁用抢占，可能在get poolLocal前，当前G1被其他G抢占，等到G1在再运行时就跑到了其他的P上，导致拿到的poolLocal不是当前的P所持有的poolLocal**）。代码如下：
-
-```go
-func (p *Pool) Put(x any) {
-	// ...
-	l, _ := p.pin()  // 调用抢占，获取当前P的poolLocal
-	if l.private == nil {
-l.private = x
-x = nil
-	}
-	if x != nil {
-l.shared.pushHead(x)
-	}
-	runtime_procUnpin() // 操作完成后，开启抢占
-	if race.Enabled {
-race.Enable()
-	}
-}
-```
-
-那`p.pin()`是如何知道poolLocal的呢？上面提到的`local`其实等价于`[P]poolLocal`，使用时根据当前的pid（P id）拿到对应的poolLocal，`p.pin()`中会调用`indexLocal()`获取当前的P，代码如下：
-
-```go
-func indexLocal(l unsafe.Pointer, i int) *poolLocal {
-	lp := unsafe.Pointer(uintptr(l) + uintptr(i)*unsafe.Sizeof(poolLocal{}))
-	return (*poolLocal)(lp)
-}
-```
-
-接下来看下poolLocal的数据结构：
-
-```go
-type poolLocal struct {
-	poolLocalInternal
-	pad [128 - unsafe.Sizeof(poolLocalInternal{})%128]byte
-}
-```
-
-其中`pad`字段是一个填充字节，主要是为了能在一个cache line中。因为sync.Pool是在go runtime内部运行的，所以要求数据的存取尽可能的高性能。`poolLocalInternal`是保存数据真正的结构。
+- # 内部实现
+	- sync.Pool是对象复用的一种技术，它是协程安全的。值得注意的是它在清除对象是自动的（在GC时清除），且不会通知用户，如果此时对象只被Pool持有，那么可能会被释放（存放在victim的资源可能在GC时会被释放）。
+	- sync.Pool的定义如下：
+	  ```go
+	  type Pool struct {
+	  	noCopy noCopy
+	  	local     unsafe.Pointer // local fixed-size per-P pool, actual type is [P]poolLocal
+	  	localSize uintptr        // size of the local array
+	  	victim     unsafe.Pointer // local from previous cycle
+	  	victimSize uintptr        // size of victims array
+	  	New func() any
+	  }
+	  ```
+	  
+	  其中`noCopy`表示在第一次使用后就不能拷贝，如果出现拷贝，可以配合go vet检测出。`local`其实指向了一个`poolLocal`的数组。长度为P（GMP模型）的数量。每个index下保存着当前P所持有的对象池。`victimSize`保存了上一次清理前的`local`所持有的对象池，这个会在Get、GC的时候会用到，对于平滑性能很重要。`New`是唯一向用户暴露的字段，它表示如果当前pool中没有可用的资源时，会调用该函数去创建新对象然后返回给用户。
+	- ## poolLocal
+		- `poolLocal`是跟P绑定的，用来存放所有资源对象的结构体。`sync.Pool`**能够在多个goroutinue中并发访问也是因为每个G只访问当前P的poolLocal，单个P一次只能运行一个G，所以在P的视角上是单线程，所以是线程安全的。**
+		  
+		  在sync.Pool暴露的Put和Get方法中，都会调用`pin`这个方法。因为go支持抢占式调度，所以在拿poolLocal的时候需要禁用抢占，直到操作完成后才把抢占打开。（根据goroutine的特性，G会在各个P中流转，**如果不禁用抢占，可能在get poolLocal前，当前G1被其他G抢占，等到G1在再运行时就跑到了其他的P上，导致拿到的poolLocal不是当前的P所持有的poolLocal**）。代码如下：
+		  
+		  ```go
+		  func (p *Pool) Put(x any) {
+		  	// ...
+		  	l, _ := p.pin()  // 调用抢占，获取当前P的poolLocal
+		  	if l.private == nil {
+		  l.private = x
+		  x = nil
+		  	}
+		  	if x != nil {
+		  l.shared.pushHead(x)
+		  	}
+		  	runtime_procUnpin() // 操作完成后，开启抢占
+		  	if race.Enabled {
+		  race.Enable()
+		  	}
+		  }
+		  ```
+		  
+		  那`p.pin()`是如何知道poolLocal的呢？上面提到的`local`其实等价于`[P]poolLocal`，使用时根据当前的pid（P id）拿到对应的poolLocal，`p.pin()`中会调用`indexLocal()`获取当前的P，代码如下：
+		  
+		  ```go
+		  func indexLocal(l unsafe.Pointer, i int) *poolLocal {
+		  	lp := unsafe.Pointer(uintptr(l) + uintptr(i)*unsafe.Sizeof(poolLocal{}))
+		  	return (*poolLocal)(lp)
+		  }
+		  ```
+		  
+		  接下来看下poolLocal的数据结构：
+		  
+		  ```go
+		  type poolLocal struct {
+		  	poolLocalInternal
+		  	pad [128 - unsafe.Sizeof(poolLocalInternal{})%128]byte
+		  }
+		  ```
+		  
+		  其中`pad`字段是一个填充字节，主要是为了能在一个cache line中。因为sync.Pool是在go runtime内部运行的，所以要求数据的存取尽可能的高性能。`poolLocalInternal`是保存数据真正的结构。
 ## poolLocalInternal
 
 `poolLocalInternal`是存放对象的数据结构。结构如下：
