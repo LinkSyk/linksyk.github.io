@@ -211,10 +211,6 @@ title:: 深入理解 golang 的 sync.Pool
 	  	oldPools, allPools = allPools, nil
 	  }
 	  ```
-# 参考
-
-[Deep analysis of Golang sync.Pool underlying principles - SoByte](https://www.sobyte.net/post/2022-03/think-in-sync-pool/)
-
-[深度解密Go语言之sync.pool | qcrao](https://www.qcrao.com/2020/04/20/dive-into-go-sync-pool/#pack-unpack)
--
--
+- # 参考
+	- [Deep analysis of Golang sync.Pool underlying principles - SoByte](https://www.sobyte.net/post/2022-03/think-in-sync-pool/)
+	- [深度解密Go语言之sync.pool | qcrao](https://www.qcrao.com/2020/04/20/dive-into-go-sync-pool/#pack-unpack)
