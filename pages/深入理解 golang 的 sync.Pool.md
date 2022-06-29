@@ -21,9 +21,8 @@ title:: 深入理解 golang 的 sync.Pool
 	  
 	  其中`noCopy`表示在第一次使用后就不能拷贝，如果出现拷贝，可以配合go vet检测出。`local`其实指向了一个`poolLocal`的数组。长度为P（GMP模型）的数量。每个index下保存着当前P所持有的对象池。`victimSize`保存了上一次清理前的`local`所持有的对象池，这个会在Get、GC的时候会用到，对于平滑性能很重要。`New`是唯一向用户暴露的字段，它表示如果当前pool中没有可用的资源时，会调用该函数去创建新对象然后返回给用户。
 	- ## poolLocal
-		- `poolLocal`是跟P绑定的，用来存放所有资源对象的结构体。`sync.Pool`**能够在多个goroutinue中并发访问也是因为每个G只访问当前P的poolLocal，单个P一次只能运行一个G，所以在P的视角上是单线程，所以是线程安全的。**
-		  
-		  在sync.Pool暴露的Put和Get方法中，都会调用`pin`这个方法。因为go支持抢占式调度，所以在拿poolLocal的时候需要禁用抢占，直到操作完成后才把抢占打开。（根据goroutine的特性，G会在各个P中流转，**如果不禁用抢占，可能在get poolLocal前，当前G1被其他G抢占，等到G1在再运行时就跑到了其他的P上，导致拿到的poolLocal不是当前的P所持有的poolLocal**）。代码如下：
+		- `poolLocal`是跟P绑定的，用来存放所有资源对象的结构体。`sync.Pool`**能够在多个goroutinue中并发访问也是因为每个G只访问当前P的poolLocal，单个P一次只能运行一个G，所以在P的视角上是单线程，所以是线程安全的。
+		- 在sync.Pool暴露的Put和Get方法中，都会调用`pin`这个方法。因为go支持抢占式调度，所以在拿poolLocal的时候需要禁用抢占，直到操作完成后才把抢占打开。（根据goroutine的特性，G会在各个P中流转，**如果不禁用抢占，可能在get poolLocal前，当前G1被其他G抢占，等到G1在再运行时就跑到了其他的P上，导致拿到的poolLocal不是当前的P所持有的poolLocal**）。代码如下：
 		  
 		  ```go
 		  func (p *Pool) Put(x any) {
@@ -62,69 +61,68 @@ title:: 深入理解 golang 的 sync.Pool
 		  ```
 		  
 		  其中`pad`字段是一个填充字节，主要是为了能在一个cache line中。因为sync.Pool是在go runtime内部运行的，所以要求数据的存取尽可能的高性能。`poolLocalInternal`是保存数据真正的结构。
-## poolLocalInternal
-
-`poolLocalInternal`是存放对象的数据结构。结构如下：
-
-```go
-type poolLocalInternal struct {
-	private any       // Can be used only by the respective P.
-	shared  poolChain // Local P can pushHead/popHead; any P can popTail.
-}
-```
-
-`private`字段会作为sync.Pool的Put、Get的第一个操作对象，避免频繁操作`shared`数据结构，也是一种提高性能的手段。
-
-poolChain是一个双向链表，链表的每个节点都是环形数组。结构如下：
-
-```go
-type poolChain struct {
-	head *poolChainElt
-	tail *poolChainElt
-}
-type poolChainElt struct {
-	poolDequeue
-	next, prev *poolChainElt
-}
-type poolDequeue struct {
-	headTail uint64
-	vals []eface
-}
-
-```
-
-`poolChainElt`中的`poolDequeue`是一个环形数组。
+	- ## poolLocalInternal
+		- `poolLocalInternal`是存放对象的数据结构。结构如下：
+		  
+		  ```go
+		  type poolLocalInternal struct {
+		  	private any       // Can be used only by the respective P.
+		  	shared  poolChain // Local P can pushHead/popHead; any P can popTail.
+		  }
+		  ```
+		  
+		  `private`字段会作为sync.Pool的Put、Get的第一个操作对象，避免频繁操作`shared`数据结构，也是一种提高性能的手段。
+		  
+		  poolChain是一个双向链表，链表的每个节点都是环形数组。结构如下：
+		  
+		  ```go
+		  type poolChain struct {
+		  	head *poolChainElt
+		  	tail *poolChainElt
+		  }
+		  type poolChainElt struct {
+		  	poolDequeue
+		  	next, prev *poolChainElt
+		  }
+		  type poolDequeue struct {
+		  	headTail uint64
+		  	vals []eface
+		  }
+		  
+		  ```
+		  
+		  `poolChainElt`中的`poolDequeue`是一个环形数组。
 # 如何存取对象
-## 存对象
-
-存对象相对简单，上面讲到其实存储对象的数据结构是一个双向链表，链表节点是一个双端队列。首先会在队列首找是否有有效的节点，没有的话新建一个节点，然后把值插入进去。
-
-```go
-func (c *poolChain) pushHead(val any) {
-	d := c.head
-	if d == nil {
-d = new(poolChainElt)
-d.vals = make([]eface, initSize)
-c.head = d
-storePoolChainElt(&c.tail, d)
-	}
-
-	if d.pushHead(val) {
-return
-	}
-	// 每次新建时都以两倍大小扩充
-	newSize := len(d.vals) * 2
-	if newSize >= dequeueLimit {
-// Can't make it any bigger.
-newSize = dequeueLimit
-	}
-	d2 := &poolChainElt{prev: d}
-	d2.vals = make([]eface, newSize)
-	c.head = d2
-	storePoolChainElt(&d.next, d2)
-	d2.pushHead(val)
-}
-```
+	- ## 存对象
+	  
+	  存对象相对简单，上面讲到其实存储对象的数据结构是一个双向链表，链表节点是一个双端队列。首先会在队列首找是否有有效的节点，没有的话新建一个节点，然后把值插入进去。
+	  
+	  ```go
+	  func (c *poolChain) pushHead(val any) {
+	  	d := c.head
+	  	if d == nil {
+	  d = new(poolChainElt)
+	  d.vals = make([]eface, initSize)
+	  c.head = d
+	  storePoolChainElt(&c.tail, d)
+	  	}
+	  
+	  	if d.pushHead(val) {
+	  return
+	  	}
+	  	// 每次新建时都以两倍大小扩充
+	  	newSize := len(d.vals) * 2
+	  	if newSize >= dequeueLimit {
+	  // Can't make it any bigger.
+	  newSize = dequeueLimit
+	  	}
+	  	d2 := &poolChainElt{prev: d}
+	  	d2.vals = make([]eface, newSize)
+	  	c.head = d2
+	  	storePoolChainElt(&d.next, d2)
+	  	d2.pushHead(val)
+	  }
+	  ```
 ## 取对象
 
 取对象相对复杂一点，除了在本地取，它还会尝试从其他地方中窃取，具体顺序如下：
