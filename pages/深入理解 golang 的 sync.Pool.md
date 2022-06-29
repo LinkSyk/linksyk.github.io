@@ -1,6 +1,6 @@
 title:: 深入理解 golang 的 sync.Pool
 
-- tags:: golang
+- tags:: [[golang]]
 - # 什么是sync.Pool?
 	- 它是一种资源复用的机制。类似连接池、线程池。可以让我们尽可能少地创建新资源，复用以前的资源。
 - # 为什么要使用sync.Pool?
