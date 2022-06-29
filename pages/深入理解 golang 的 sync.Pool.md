@@ -94,128 +94,123 @@ title:: 深入理解 golang 的 sync.Pool
 		  `poolChainElt`中的`poolDequeue`是一个环形数组。
 # 如何存取对象
 	- ## 存对象
-	  
-	  存对象相对简单，上面讲到其实存储对象的数据结构是一个双向链表，链表节点是一个双端队列。首先会在队列首找是否有有效的节点，没有的话新建一个节点，然后把值插入进去。
+		- 存对象相对简单，上面讲到其实存储对象的数据结构是一个双向链表，链表节点是一个双端队列。首先会在队列首找是否有有效的节点，没有的话新建一个节点，然后把值插入进去。
+		  ```go
+		  func (c *poolChain) pushHead(val any) {
+		  	d := c.head
+		  	if d == nil {
+		  d = new(poolChainElt)
+		  d.vals = make([]eface, initSize)
+		  c.head = d
+		  storePoolChainElt(&c.tail, d)
+		  	}
+		  
+		  	if d.pushHead(val) {
+		  return
+		  	}
+		  	// 每次新建时都以两倍大小扩充
+		  	newSize := len(d.vals) * 2
+		  	if newSize >= dequeueLimit {
+		  // Can't make it any bigger.
+		  newSize = dequeueLimit
+		  	}
+		  	d2 := &poolChainElt{prev: d}
+		  	d2.vals = make([]eface, newSize)
+		  	c.head = d2
+		  	storePoolChainElt(&d.next, d2)
+		  	d2.pushHead(val)
+		  }
+		  ```
+	- ## 取对象
+		- 取对象相对复杂一点，除了在本地取，它还会尝试从其他地方中窃取，具体顺序如下：
+		  1. private中取。
+		  2. private中没有，从本地P的poolLocal取。
+		  3. 本地P没有，从其他P的poolLocal中取。
+		  4. 其他P中没有，从victim中取。
+		  
+		  ```go
+		  func (p *Pool) Get() any {
+		  
+		  	l, pid := p.pin()
+		  	x := l.private
+		  	l.private = nil
+		  	if x == nil {
+		  x, _ = l.shared.popHead()
+		  if x == nil {
+		  	// 尝试从其他local、本地的victim窃取
+		  	x = p.getSlow(pid)
+		  }
+		  	}
+		  	runtime_procUnpin()
+		  	if x == nil && p.New != nil {
+		  x = p.New()
+		  	}
+		  	return x
+		  }
+		  ```
+		  
+		  ```go
+		  func (p *Pool) getSlow(pid int) any {
+		  	// See the comment in pin regarding ordering of the loads.
+		  	size := runtime_LoadAcquintptr(&p.localSize) // load-acquire
+		  	locals := p.local                            // load-consume
+		  	// 尝试从其他的P中窃取
+		  	for i := 0; i < int(size); i++ {
+		  l := indexLocal(locals, (pid+i+1)%int(size))
+		  if x, _ := l.shared.popTail(); x != nil {
+		  	return x
+		  }
+		  	}
+		  	// 在其他P中拿不到对象后，会尝试从victim中获取。保证这样顺序是因为，尽可能让vicim的对象
+		  	// 能够被GC。
+		  	size = atomic.LoadUintptr(&p.victimSize)
+		  	if uintptr(pid) >= size {
+		  return nil
+		  	}
+		  	locals = p.victim
+		  	l := indexLocal(locals, pid)
+		  	if x := l.private; x != nil {
+		  l.private = nil
+		  return x
+		  	}
+		  	for i := 0; i < int(size); i++ {
+		  l := indexLocal(locals, (pid+i)%int(size))
+		  if x, _ := l.shared.popTail(); x != nil {
+		  	return x
+		  }
+		  	}
+		  	atomic.StoreUintptr(&p.victimSize, 0)
+		  
+		  	return nil
+		  }
+		  ```
+- # 对象的清理时机
+	- `poolCleanup`负责清理所有P上面的poolLocal，因为在GC的时候，整个程序处于STW，所以可以直接不加锁直接调用这个函数清理所有的poolLocal。这里值得注意的是当前的poolLocal没有直接释放，而是存放到了victim这个变量中。这样做的理由是防止每次GC都把对象清理完，导致GC后的Get需要创建新的对象。有了这一步操作，可以让整个程序性能表现得更加的平滑。
 	  
 	  ```go
-	  func (c *poolChain) pushHead(val any) {
-	  	d := c.head
-	  	if d == nil {
-	  d = new(poolChainElt)
-	  d.vals = make([]eface, initSize)
-	  c.head = d
-	  storePoolChainElt(&c.tail, d)
-	  	}
+	  func poolCleanup() {
+	  	// This function is called with the world stopped, at the beginning of a garbage collection.
+	  	// It must not allocate and probably should not call any runtime functions.
 	  
-	  	if d.pushHead(val) {
-	  return
+	  	// Because the world is stopped, no pool user can be in a
+	  	// pinned section (in effect, this has all Ps pinned).
+	  	// Drop victim caches from all pools.
+	  	for _, p := range oldPools {
+	  p.victim = nil
+	  p.victimSize = 0
 	  	}
-	  	// 每次新建时都以两倍大小扩充
-	  	newSize := len(d.vals) * 2
-	  	if newSize >= dequeueLimit {
-	  // Can't make it any bigger.
-	  newSize = dequeueLimit
+	  	// Move primary cache to victim cache.
+	  	for _, p := range allPools {
+	  p.victim = p.local
+	  p.victimSize = p.localSize
+	  p.local = nil
+	  p.localSize = 0
 	  	}
-	  	d2 := &poolChainElt{prev: d}
-	  	d2.vals = make([]eface, newSize)
-	  	c.head = d2
-	  	storePoolChainElt(&d.next, d2)
-	  	d2.pushHead(val)
+	  	// The pools with non-empty primary caches now have non-empty
+	  	// victim caches and no pools have primary caches.
+	  	oldPools, allPools = allPools, nil
 	  }
 	  ```
-## 取对象
-
-取对象相对复杂一点，除了在本地取，它还会尝试从其他地方中窃取，具体顺序如下：
-
-1. private中取。
-2. private中没有，从本地P的poolLocal取。
-3. 本地P没有，从其他P的poolLocal中取。
-4. 其他P中没有，从victim中取。
-
-```go
-func (p *Pool) Get() any {
-
-	l, pid := p.pin()
-	x := l.private
-	l.private = nil
-	if x == nil {
-x, _ = l.shared.popHead()
-if x == nil {
-	// 尝试从其他local、本地的victim窃取
-	x = p.getSlow(pid)
-}
-	}
-	runtime_procUnpin()
-	if x == nil && p.New != nil {
-x = p.New()
-	}
-	return x
-}
-```
-
-```go
-func (p *Pool) getSlow(pid int) any {
-	// See the comment in pin regarding ordering of the loads.
-	size := runtime_LoadAcquintptr(&p.localSize) // load-acquire
-	locals := p.local                            // load-consume
-	// 尝试从其他的P中窃取
-	for i := 0; i < int(size); i++ {
-l := indexLocal(locals, (pid+i+1)%int(size))
-if x, _ := l.shared.popTail(); x != nil {
-	return x
-}
-	}
-	// 在其他P中拿不到对象后，会尝试从victim中获取。保证这样顺序是因为，尽可能让vicim的对象
-	// 能够被GC。
-	size = atomic.LoadUintptr(&p.victimSize)
-	if uintptr(pid) >= size {
-return nil
-	}
-	locals = p.victim
-	l := indexLocal(locals, pid)
-	if x := l.private; x != nil {
-l.private = nil
-return x
-	}
-	for i := 0; i < int(size); i++ {
-l := indexLocal(locals, (pid+i)%int(size))
-if x, _ := l.shared.popTail(); x != nil {
-	return x
-}
-	}
-	atomic.StoreUintptr(&p.victimSize, 0)
-
-	return nil
-}
-```
-# 对象的清理时机
-
-`poolCleanup`负责清理所有P上面的poolLocal，因为在GC的时候，整个程序处于STW，所以可以直接不加锁直接调用这个函数清理所有的poolLocal。这里值得注意的是当前的poolLocal没有直接释放，而是存放到了victim这个变量中。这样做的理由是防止每次GC都把对象清理完，导致GC后的Get需要创建新的对象。有了这一步操作，可以让整个程序性能表现得更加的平滑。
-
-```go
-func poolCleanup() {
-	// This function is called with the world stopped, at the beginning of a garbage collection.
-	// It must not allocate and probably should not call any runtime functions.
-
-	// Because the world is stopped, no pool user can be in a
-	// pinned section (in effect, this has all Ps pinned).
-	// Drop victim caches from all pools.
-	for _, p := range oldPools {
-p.victim = nil
-p.victimSize = 0
-	}
-	// Move primary cache to victim cache.
-	for _, p := range allPools {
-p.victim = p.local
-p.victimSize = p.localSize
-p.local = nil
-p.localSize = 0
-	}
-	// The pools with non-empty primary caches now have non-empty
-	// victim caches and no pools have primary caches.
-	oldPools, allPools = allPools, nil
-}
-```
 # 参考
 
 [Deep analysis of Golang sync.Pool underlying principles - SoByte](https://www.sobyte.net/post/2022-03/think-in-sync-pool/)
