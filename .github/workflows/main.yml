@@ -3,7 +3,13 @@ name: CI
 # Controls when the workflow will run
 on:
   push:
+<<<<<<< HEAD
     branches: [main]
+=======
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+>>>>>>> b8e28c4f1d29c4e28f1fe1ac5e6d8e0367785c4c
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
